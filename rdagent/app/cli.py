@@ -26,6 +26,7 @@ from rdagent.app.finetune.llm.loop import main as llm_finetune
 from rdagent.app.general_model.general_model import (
     extract_models_and_implement as general_model,
 )
+from rdagent.app.auto_alpha_loop.factor import main as auto_alpha_factor
 from rdagent.app.qlib_rd_loop.factor import main as fin_factor
 from rdagent.app.qlib_rd_loop.factor_from_report import main as fin_factor_report
 from rdagent.app.qlib_rd_loop.model import main as fin_model
@@ -88,6 +89,25 @@ def fin_factor_cli(
     checkout: CheckoutOption = True,
 ):
     fin_factor(path=path, step_n=step_n, loop_n=loop_n, all_duration=all_duration, checkout=checkout)
+
+
+@app.command(name="auto_alpha_factor")
+def auto_alpha_factor_cli(
+    path: Optional[str] = None,
+    step_n: Optional[int] = None,
+    loop_n: Optional[int] = None,
+    all_duration: Optional[str] = None,
+    checkout: CheckoutOption = True,
+):
+    """Autonomous alpha-mining loop on top of auto-alpha-playground.
+
+    Configure via AUTO_ALPHA_* env vars or a .env file. Required settings:
+      AUTO_ALPHA_PLAYGROUND_PATH=/path/to/auto-alpha-playground
+      AUTO_ALPHA_EVAL_CONFIG_NAME=configs/train_baseline_eval_1m.yaml
+    """
+    auto_alpha_factor(
+        path=path, step_n=step_n, loop_n=loop_n, all_duration=all_duration, checkout=checkout
+    )
 
 
 @app.command(name="fin_model")

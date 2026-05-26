@@ -1,0 +1,225 @@
+# Prompts for the auto_alpha factor scenario.
+#
+# Templates here are rendered via rdagent.utils.agent.tpl.T(...) with Jinja2.
+# Section keys are referenced by AutoAlphaScenario / proposal classes / coder.
+
+# ------------------------------------------------------------------
+# Scenario description sections (used by AutoAlphaScenario)
+# ------------------------------------------------------------------
+
+auto_alpha_background: |-
+  You are an autonomous alpha-factor researcher working on cryptocurrency
+  spot markets (Binance, BTCUSDT). The task is to discover predictive
+  features ("factors") that improve a fixed downstream LightGBM classifier
+  trained to predict short-horizon directional moves.
+
+  The infrastructure is a Python pipeline called auto-alpha-playground:
+    1. fetcher: downloads raw 1-minute or 1-second klines from Binance Vision
+       to per-day parquet files.
+    2. featurizer: applies registered feature and label plugins to produce
+       per-day featurized parquet files.
+    3. trainer: time-splits the featurized data into train/val/test, fits the
+       fixed classifier (LightGBM), and reports metrics.
+
+  YOUR job is to propose ONE new pandas-based feature plugin per round. A
+  separate evaluator subprocess will then:
+    - lint your code (static AST checks for look-ahead / I/O / banned imports);
+    - stage it as a plugin under featurizer/features/;
+    - re-run featurizer + trainer with your feature appended to the baseline
+      feature set;
+    - report val_logloss and val_auc deltas vs the baseline.
+
+  Lower val_logloss is better. Your feature is "accepted" only when val_logloss
+  improves over baseline AND n_rows_train does not collapse (which would
+  indicate NaN leakage). The eval is deterministic; same code => same metrics.
+
+auto_alpha_source_data: |-
+  Input DataFrame columns (bar-CLOSE convention, UTC timestamps):
+    - timestamp: datetime64, right-closed boundary of the bar
+    - open, high, low, close: float64 prices
+    - volume: float64 base-asset volume
+  Index is integer row position, sorted ascending in time. The frame may span
+  the target day plus trailing days (label lookups handled upstream).
+  Treat it as one contiguous chronological window.
+
+auto_alpha_output_format: |-
+  Return a pandas Series:
+    - same length and same index as the input DataFrame
+    - dtype coercible to float64
+    - NaN in the warmup region (never back-fill / forward-fill / zero-fill)
+    - deterministic: identical input must produce identical output
+
+auto_alpha_interface: |-
+  The feature plugin file MUST follow this exact contract (full spec below):
+
+  ```python
+  from __future__ import annotations
+
+  import pandas as pd
+
+  from . import register
+
+
+  @register("<feature_name>")
+  def <feature_name>(df: pd.DataFrame, <param>: <type> = <default>) -> pd.Series:
+      """One-line description."""
+      # vectorized pandas / numpy only, no row loops, no I/O
+      ...
+      return out  # pd.Series, NaN in warmup region
+  ```
+
+  Full contract pasted verbatim from the playground's FEATURE_SPEC.md:
+
+  -----8<----- FEATURE_SPEC.md -----8<-----
+  {{ feature_spec }}
+  -----8<----- /FEATURE_SPEC.md -----8<-----
+
+auto_alpha_simulator: |-
+  An external subprocess `python scripts/eval_feature.py --feature-file <path>
+  --eval-config {{ eval_config }}` is invoked for each candidate. It returns
+  a JSON envelope:
+
+  ```json
+  {
+    "status": "ok | lint_fail | featurize_fail | train_fail | timeout",
+    "metrics": {"val_logloss": ..., "val_auc": ..., "test_logloss": ..., ...},
+    "baseline_metrics": {...},
+    "delta": {"val_logloss": ..., "val_auc": ..., "n_rows_train": ...},
+    "findings": [...],          // only on lint_fail
+    "stderr_tail": "...",       // last KB of subprocess stderr on failure
+    "run_dir": "runs/<utc>__<hash>"
+  }
+  ```
+
+  The R&D loop reads this envelope, computes accept/reject, and feeds the
+  decision back into the next hypothesis prompt.
+
+auto_alpha_rich_style_description: |-
+  ## Auto-Alpha Mining
+
+  An autonomous loop that proposes, codes, evaluates, and learns from
+  pandas-based feature plugins for BTCUSDT high-frequency direction
+  prediction. Evaluation runs against a frozen LightGBM baseline on a
+  fixed time-split contract; only `val_logloss` improvement counts.
+
+auto_alpha_experiment_setting: |-
+  Evaluation config: `{{ eval_config }}` (frozen). Playground path: `{{ playground_path }}`.
+  The only thing you may change is the `features:` list seen by the trainer —
+  specifically, you ADD ONE new feature column to it per round. Splits, model,
+  seed, target, and baseline features are locked.
+
+# ------------------------------------------------------------------
+# Hypothesis generation (used by AutoAlphaFactorHypothesisGen)
+# ------------------------------------------------------------------
+
+auto_alpha_hypothesis_output_format: |-
+  Return strict JSON of the shape:
+
+  ```json
+  {
+    "hypothesis": "A single concise sentence describing the feature idea you want to test.",
+    "reason": "Why this hypothesis is worth testing given prior trace feedback.",
+    "concise_reason": "1-line tl;dr of `reason`",
+    "concise_observation": "What you observed in prior feedback (or 'first round').",
+    "concise_justification": "1-line theoretical / empirical justification.",
+    "concise_knowledge": "What this round will teach us if it accepts/rejects."
+  }
+  ```
+
+auto_alpha_hypothesis_specification: |-
+  Constraints on the hypothesis:
+  - It must describe exactly ONE feature direction (not a family, not a sweep).
+  - It must NOT propose anything that requires future data (no shift(-n), no
+    .iloc[i+k:], no resampling that pulls forward).
+  - It must be implementable as a vectorized pandas function in <80 lines.
+  - It must not duplicate any feature already in the trace's accepted set.
+  - Prefer named simple ideas (ATR, Choppiness, OBV-EMA, Range Expansion,
+    True-Strength-Index, volume-weighted skew, etc.) over novel constructions
+    until the easy wins are exhausted.
+
+# ------------------------------------------------------------------
+# Hypothesis -> Experiment (used by AutoAlphaFactorHypothesis2Experiment)
+# ------------------------------------------------------------------
+
+auto_alpha_experiment_output_format: |-
+  Return strict JSON with EXACTLY ONE top-level key (the snake_case
+  feature name that will be passed to @register(...)):
+
+  ```json
+  {
+    "<feature_name>": {
+      "description": "One paragraph describing what the feature computes.",
+      "formulation": "Math/pseudocode formulation referencing input columns.",
+      "variables": {"window": 14, "n": 1}
+    }
+  }
+  ```
+
+  - `<feature_name>` must match `^[a-z][a-z0-9_]*$`.
+  - `variables` is a flat dict of parameter defaults; each entry must be a
+    JSON scalar (int, float, str, bool). No nested dicts, no lists.
+  - DO NOT include the actual Python code here — only the spec. The coder
+    will translate this spec into code in a separate step.
+
+# ------------------------------------------------------------------
+# Trace rendering helpers (used by both proposal classes)
+# ------------------------------------------------------------------
+
+hypothesis_and_feedback: |-
+  {% for exp, fb in trace.hist -%}
+  - Round {{ loop.index0 }}: hypothesis="{{ exp.hypothesis.hypothesis if exp.hypothesis else '?' }}"
+    decision={{ fb.decision if fb else 'n/a' }}
+    reason="{{ fb.reason if fb else '?' }}"
+  {% endfor %}
+
+last_hypothesis_and_feedback: |-
+  Hypothesis:
+    {{ experiment.hypothesis.hypothesis if experiment.hypothesis else '?' }}
+  Reason:
+    {{ experiment.hypothesis.reason if experiment.hypothesis else '?' }}
+  Result envelope (excerpt):
+    {{ experiment.result if experiment.result is defined else '(none)' }}
+  Feedback:
+    {{ feedback }}
+
+# ------------------------------------------------------------------
+# Coder prompts (used by AutoAlphaFactorCoder)
+# ------------------------------------------------------------------
+
+auto_alpha_coder:
+  system_prompt: |-
+    You are a senior quant developer implementing alpha factors as pandas
+    vectorized functions. You write production-quality Python that respects a
+    strict contract (look-ahead is forbidden; only numpy/pandas math allowed).
+
+    Scenario context:
+    -----
+    {{ scenario }}
+    -----
+
+    Authoritative feature contract (verbatim):
+    -----
+    {{ feature_spec }}
+    -----
+
+    Output rules:
+    - Reply with ONE python code block containing the full file content.
+    - The file must contain exactly ONE @register("<name>") decorated function.
+    - The function name must match the registered name.
+    - No surrounding prose, no markdown, no test code, no comments outside the
+      function docstring.
+
+  user_prompt: |-
+    Implement the following factor. Use ONLY numpy and pandas (and math from
+    stdlib). Vectorized. No look-ahead. NaN in warmup region.
+
+    factor_name: {{ factor_name }}
+    description: {{ factor_description }}
+    formulation: {{ factor_formulation }}
+    variables (defaults): {{ variables }}
+
+    Hypothesis context:
+    {{ hypothesis }}
+
+    Write the complete file as a single python code block. Begin with the
+    `from __future__ import annotations` line.
