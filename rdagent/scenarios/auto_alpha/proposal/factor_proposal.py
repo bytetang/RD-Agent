@@ -31,6 +31,26 @@ from rdagent.scenarios.auto_alpha.experiment.factor_experiment import (
 from rdagent.utils.agent.tpl import T
 
 
+def _prior_proposal_names(trace: Trace) -> tuple[list[str], list[str]]:
+    """Walk trace.hist and split prior proposed factor_names into
+    (accepted, rejected). Used to give the LLM an explicit "don't repeat
+    these" list — observed in Round-2 that the LLM proposed eom 3× and
+    vwap_dev 2× because the prompt only listed accepted features.
+    """
+    accepted: list[str] = []
+    rejected: list[str] = []
+    for past_exp, fb in trace.hist:
+        if not isinstance(past_exp, AutoAlphaFactorExperiment):
+            continue
+        for task in past_exp.sub_tasks or []:
+            name = getattr(task, "factor_name", None)
+            if not name:
+                continue
+            target = accepted if (fb and getattr(fb, "decision", False)) else rejected
+            target.append(name)
+    return accepted, rejected
+
+
 class AutoAlphaFactorHypothesisGen(FactorHypothesisGen):
     """Asks the LLM to propose the next feature direction.
 
@@ -57,6 +77,8 @@ class AutoAlphaFactorHypothesisGen(FactorHypothesisGen):
             )
             last_hypothesis_and_feedback = hypothesis_and_feedback
 
+        accepted_names, rejected_names = _prior_proposal_names(trace)
+
         context = {
             "hypothesis_and_feedback": hypothesis_and_feedback,
             "last_hypothesis_and_feedback": last_hypothesis_and_feedback,
@@ -76,6 +98,8 @@ class AutoAlphaFactorHypothesisGen(FactorHypothesisGen):
             ).r(
                 baseline_feature_names=getattr(self.scen, "baseline_feature_names", []),
                 baseline_feature_columns=getattr(self.scen, "baseline_feature_columns", []),
+                prior_accepted_names=accepted_names,
+                prior_rejected_names=rejected_names,
             ),
         }
         return context, True
@@ -104,6 +128,8 @@ class AutoAlphaFactorHypothesis2Experiment(FactorHypothesis2Experiment):
         else:
             hyp_and_fb = "No previous hypothesis and feedback available."
 
+        accepted_names, rejected_names = _prior_proposal_names(trace)
+
         return {
             "target_hypothesis": str(hypothesis),
             "scenario": scenario_desc,
@@ -113,6 +139,8 @@ class AutoAlphaFactorHypothesis2Experiment(FactorHypothesis2Experiment):
             ).r(
                 baseline_feature_names=getattr(trace.scen, "baseline_feature_names", []),
                 baseline_feature_columns=getattr(trace.scen, "baseline_feature_columns", []),
+                prior_accepted_names=accepted_names,
+                prior_rejected_names=rejected_names,
             ),
             "target_list": [],
             "RAG": None,
@@ -174,8 +202,14 @@ class AutoAlphaFactorExperiment2Feedback(Experiment2Feedback):
 
     def __init__(self, scen: Scenario) -> None:
         super().__init__(scen)
-        # Accept any improvement (val_logloss is lower-is-better, so Δ < 0 is good).
-        # A future tightening pass can require Δ <= -0.0005 or similar.
+        # Accept only when BOTH val and test logloss improve.
+        # Round-1 (5-feature baseline) found 70% val accepts with 79% test
+        # robustness; Round-2 (10-feature baseline) saw val accepts drop to
+        # 40% but test robustness collapsed to 15% — most "val winners"
+        # were noise / val-overfit. The dual-improvement rule keeps test
+        # honest by treating it as a second hold-out, not just a report.
+        # Both deltas must be strictly negative (we'll only call a candidate
+        # a winner if it survives BOTH the validation and test set).
         self.accept_logloss_delta_threshold: float = 0.0
         # If n_rows_train drops by more than this fraction, suspect NaN leakage.
         self.nan_drop_fraction_threshold: float = 0.05
@@ -223,6 +257,7 @@ class AutoAlphaFactorExperiment2Feedback(Experiment2Feedback):
         delta = envelope.get("delta") or {}
 
         val_delta = delta.get("val_logloss")
+        test_delta = delta.get("test_logloss")
         cand_rows = metrics.get("n_rows_train")
         base_rows = baseline.get("n_rows_train")
 
@@ -232,20 +267,33 @@ class AutoAlphaFactorExperiment2Feedback(Experiment2Feedback):
             if drop_frac > self.nan_drop_fraction_threshold:
                 nan_drop_flag = True
 
-        decision = (
+        val_passes = (
             isinstance(val_delta, (int, float))
             and val_delta < self.accept_logloss_delta_threshold
-            and not nan_drop_flag
         )
+        test_passes = (
+            isinstance(test_delta, (int, float))
+            and test_delta < self.accept_logloss_delta_threshold
+        )
+        decision = val_passes and test_passes and not nan_drop_flag
 
         reason_parts = [
             f"feature={feature_name}",
             f"status=ok",
             f"val_logloss={metrics.get('val_logloss')}",
             f"val_logloss_delta={val_delta}",
+            f"test_logloss_delta={test_delta}",
             f"val_auc_delta={delta.get('val_auc')}",
             f"n_rows_train_delta={delta.get('n_rows_train')}",
         ]
+        # Spell out exactly why the candidate was rejected so the next-round
+        # LLM has a precise signal to learn from.
+        if not val_passes:
+            reason_parts.append("REJECTED: val_logloss did not improve")
+        elif not test_passes:
+            reason_parts.append(
+                "REJECTED: val improved but test did not — likely val-overfit"
+            )
         if nan_drop_flag:
             reason_parts.append(
                 f"REJECTED: n_rows_train drop fraction exceeds "

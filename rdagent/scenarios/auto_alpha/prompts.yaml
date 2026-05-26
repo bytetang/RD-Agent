@@ -151,9 +151,18 @@ auto_alpha_hypothesis_specification: |-
     new name; collision with any of these will hard-fail the round):
     {% for name in baseline_feature_names %}- `{{ name }}`
     {% endfor %}
+  - **Previously proposed in this session** (DO NOT propose any of these
+    again — accepted ones are already in baseline, rejected ones already
+    failed and re-trying with cosmetic changes is wasted budget):
+    Accepted: {% if prior_accepted_names %}{{ prior_accepted_names | join(", ") }}{% else %}(none yet){% endif %}
+    Rejected: {% if prior_rejected_names %}{{ prior_rejected_names | join(", ") }}{% else %}(none yet){% endif %}
   - Prefer named simple ideas (ATR, Choppiness, OBV-EMA, Range Expansion,
     True-Strength-Index, volume-weighted skew, etc.) over novel constructions
     until the easy wins are exhausted.
+  - **Acceptance bar:** the candidate must improve BOTH val_logloss AND
+    test_logloss (test is held out — no peeking by selection bias). A
+    candidate that improves val but degrades test will be rejected as
+    val-overfit.
 
 # ------------------------------------------------------------------
 # Hypothesis -> Experiment (used by AutoAlphaFactorHypothesis2Experiment)
@@ -178,6 +187,11 @@ auto_alpha_experiment_output_format: |-
     (collision = hard fail):
     {% for name in baseline_feature_names %}- `{{ name }}`
     {% endfor %}
+  - `<feature_name>` MUST NOT match any previously proposed name in this
+    session (accepted ones are in baseline already; rejected ones already
+    failed and proposing them again wastes the round):
+    {% if prior_accepted_names or prior_rejected_names %}    Accepted: {% if prior_accepted_names %}{{ prior_accepted_names | join(", ") }}{% else %}(none yet){% endif %}
+    Rejected: {% if prior_rejected_names %}{{ prior_rejected_names | join(", ") }}{% else %}(none yet){% endif %}{% else %}    (no prior proposals yet){% endif %}
   - `variables` is a flat dict of parameter defaults; each entry must be a
     JSON scalar (int, float, str, bool). No nested dicts, no lists.
   - DO NOT include the actual Python code here — only the spec. The coder
