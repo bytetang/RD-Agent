@@ -35,6 +35,12 @@ _COLUMN_TO_REGISTERED_NAME = {
     "macd_12_26_9": "macd",
     "bollinger_20_2.0": "bollinger",
     "volume_z_20": "volume_z",
+    # Round-2 baseline additions (top-5 winners promoted after ensemble validation):
+    "tsi": "tsi",
+    "trix": "trix",
+    "atr": "atr",
+    "chop": "chop",
+    "cmf_adx_prod": "cmf_adx_prod",
 }
 
 
