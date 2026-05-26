@@ -108,6 +108,16 @@ auto_alpha_experiment_setting: |-
   specifically, you ADD ONE new feature column to it per round. Splits, model,
   seed, target, and baseline features are locked.
 
+  Baseline feature columns already in the trainer config (do NOT propose a
+  feature that produces an identical column name):
+  {% for col in baseline_feature_columns %}  - {{ col }}
+  {% endfor %}
+
+  Registered plugin names already in the playground's featurizer/features/
+  (your @register("...") string must NOT be any of these — collision will hard-fail):
+  {% for name in baseline_feature_names %}  - {{ name }}
+  {% endfor %}
+
 # ------------------------------------------------------------------
 # Hypothesis generation (used by AutoAlphaFactorHypothesisGen)
 # ------------------------------------------------------------------
@@ -133,6 +143,14 @@ auto_alpha_hypothesis_specification: |-
     .iloc[i+k:], no resampling that pulls forward).
   - It must be implementable as a vectorized pandas function in <80 lines.
   - It must not duplicate any feature already in the trace's accepted set.
+  - **Baseline already contains these feature columns** (your candidate must
+    add information BEYOND what these capture):
+    {% for col in baseline_feature_columns %}- `{{ col }}`
+    {% endfor %}
+  - **Already-registered plugin names** (your @register("name") MUST be a
+    new name; collision with any of these will hard-fail the round):
+    {% for name in baseline_feature_names %}- `{{ name }}`
+    {% endfor %}
   - Prefer named simple ideas (ATR, Choppiness, OBV-EMA, Range Expansion,
     True-Strength-Index, volume-weighted skew, etc.) over novel constructions
     until the easy wins are exhausted.
@@ -156,6 +174,10 @@ auto_alpha_experiment_output_format: |-
   ```
 
   - `<feature_name>` must match `^[a-z][a-z0-9_]*$`.
+  - `<feature_name>` MUST NOT be any of these already-registered names
+    (collision = hard fail):
+    {% for name in baseline_feature_names %}- `{{ name }}`
+    {% endfor %}
   - `variables` is a flat dict of parameter defaults; each entry must be a
     JSON scalar (int, float, str, bool). No nested dicts, no lists.
   - DO NOT include the actual Python code here — only the spec. The coder

@@ -73,7 +73,10 @@ class AutoAlphaFactorHypothesisGen(FactorHypothesisGen):
             ).r(),
             "hypothesis_specification": T(
                 "scenarios.auto_alpha.prompts:auto_alpha_hypothesis_specification"
-            ).r(),
+            ).r(
+                baseline_feature_names=getattr(self.scen, "baseline_feature_names", []),
+                baseline_feature_columns=getattr(self.scen, "baseline_feature_columns", []),
+            ),
         }
         return context, True
 
@@ -107,7 +110,10 @@ class AutoAlphaFactorHypothesis2Experiment(FactorHypothesis2Experiment):
             "hypothesis_and_feedback": hyp_and_fb,
             "experiment_output_format": T(
                 "scenarios.auto_alpha.prompts:auto_alpha_experiment_output_format"
-            ).r(),
+            ).r(
+                baseline_feature_names=getattr(trace.scen, "baseline_feature_names", []),
+                baseline_feature_columns=getattr(trace.scen, "baseline_feature_columns", []),
+            ),
             "target_list": [],
             "RAG": None,
         }, True
