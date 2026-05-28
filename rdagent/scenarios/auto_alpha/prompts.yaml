@@ -9,29 +9,36 @@
 
 auto_alpha_background: |-
   You are an autonomous alpha-factor researcher working on cryptocurrency
-  spot markets (Binance, BTCUSDT). The task is to discover predictive
-  features ("factors") that improve a fixed downstream LightGBM classifier
-  trained to predict short-horizon directional moves.
+  spot markets (Binance, BTCUSDT). Your job: discover pandas-based features
+  ("factors") that improve a fixed downstream baseline across multiple
+  prediction tasks simultaneously.
 
-  The infrastructure is a Python pipeline called auto-alpha-playground:
-    1. fetcher: downloads raw 1-minute or 1-second klines from Binance Vision
-       to per-day parquet files.
-    2. featurizer: applies registered feature and label plugins to produce
-       per-day featurized parquet files.
-    3. trainer: time-splits the featurized data into train/val/test, fits the
-       fixed classifier (LightGBM), and reports metrics.
+  Infrastructure (auto-alpha-playground):
+    - fetcher: per-day raw 1s / 1m klines from Binance Vision.
+    - featurizer: registered feature + label plugins, per-day parquet.
+    - trainer: time-split train/val/test, fits a registered model, reports
+      metrics (logloss/AUC/acc for classification, IC/ICIR/RMSE for regression).
+    - bench: the canonical benchmark CLI. `python -m bench run --features X`
+      featurizes + sweeps a panel of cells + diffs vs `benchmarks/baseline.csv`.
 
-  YOUR job is to propose ONE new pandas-based feature plugin per round. A
-  separate evaluator subprocess will then:
-    - lint your code (static AST checks for look-ahead / I/O / banned imports);
-    - stage it as a plugin under featurizer/features/;
-    - re-run featurizer + trainer with your feature appended to the baseline
-      feature set;
-    - report val_logloss and val_auc deltas vs the baseline.
+  Each round we shell out to `python -m bench run --features <your_feature>
+  --cells <preset>` which sweeps a panel of cells:
+    - classification (label = `bucket_binary`): val headline is val_acc (↑)
+    - regression (label = `forward_logret`):     val headline is val_ic_pearson (↑, signed)
 
-  Lower val_logloss is better. Your feature is "accepted" only when val_logloss
-  improves over baseline AND n_rows_train does not collapse (which would
-  indicate NaN leakage). The eval is deterministic; same code => same metrics.
+  Each cell is (interval × horizon × model). The panel spans 1m + 1s
+  intervals, multiple horizons (5min/15min/1h/4h for buckets; 30s/1min/5min
+  for 1s regression; 30min/1h/4h for 1m regression), and models
+  (lgbm/logreg for classification, linreg for regression).
+
+  The bench writes `_compare.json` with one entry per cell containing
+  `delta_headline` (signed) vs baseline. Your feature is ACCEPTED only
+  when it improves the headline on enough cells without a major regression
+  on any cell. The exact rule is given in the experiment setting.
+
+  Test-split metrics are HIDDEN at this layer to prevent test leakage; you
+  only see val-side deltas. Eval is deterministic — same code → same
+  metrics.
 
 auto_alpha_source_data: |-
   Input DataFrame columns (bar-CLOSE convention, UTC timestamps):
@@ -75,41 +82,52 @@ auto_alpha_interface: |-
   -----8<----- /FEATURE_SPEC.md -----8<-----
 
 auto_alpha_simulator: |-
-  An external subprocess `python scripts/eval_feature.py --feature-file <path>
-  --eval-config {{ eval_config }}` is invoked for each candidate. It returns
-  a JSON envelope:
+  External subprocess (run in `{{ playground_path }}`):
+
+      python -m bench run --features <feature_col> --cells {{ bench_cells }}
+
+  This featurizes (cached by feature-set hash) + sweeps the panel + writes
+  `runs/bench/<tag>/_compare.json`. The digest has shape:
 
   ```json
   {
-    "status": "ok | lint_fail | featurize_fail | train_fail | timeout",
-    "metrics": {"val_logloss": ..., "val_auc": ..., "test_logloss": ..., ...},
-    "baseline_metrics": {...},
-    "delta": {"val_logloss": ..., "val_auc": ..., "n_rows_train": ...},
-    "findings": [...],          // only on lint_fail
-    "stderr_tail": "...",       // last KB of subprocess stderr on failure
-    "run_dir": "runs/<utc>__<hash>"
+    "schema_version": 1,
+    "compared_on": "val",
+    "headline_columns": {
+      "classification": "val_acc",
+      "regression":     "val_ic_pearson"
+    },
+    "cells": [
+      {
+        "interval": "1m", "label_kind": "bucket", "horizon_s": 900,
+        "model": "lgbm", "task": "classification",
+        "headline_metric": "val_acc",
+        "baseline_headline": 0.731, "bench_headline": 0.733,
+        "delta_headline": 0.002,
+        "delta_ic_p": ..., "delta_icir_p": ..., "delta_acc": ...
+      },
+      ...
+    ]
   }
   ```
 
-  The R&D loop reads this envelope, computes accept/reject, and feeds the
-  decision back into the next hypothesis prompt.
+  The R&D loop counts cells with `delta_headline > 0` and inspects the
+  worst cell's drop, then accept/reject and feeds back to the next round.
 
 auto_alpha_rich_style_description: |-
-  ## Auto-Alpha Mining
+  ## Auto-Alpha Mining (bench panel)
 
-  An autonomous loop that proposes, codes, evaluates, and learns from
-  pandas-based feature plugins for BTCUSDT high-frequency direction
-  prediction. Evaluation runs against a frozen LightGBM baseline on a
-  fixed time-split contract; only `val_logloss` improvement counts.
+  An autonomous loop that proposes, codes, and benchmarks pandas-based
+  feature plugins for BTCUSDT spot. Each candidate is swept across the
+  bench panel (classification + regression × intervals × horizons × models).
+  Acceptance requires improvement on enough cells AND no major regression.
 
 auto_alpha_experiment_setting: |-
-  Evaluation config: `{{ eval_config }}` (frozen). Playground path: `{{ playground_path }}`.
-  The only thing you may change is the `features:` list seen by the trainer —
-  specifically, you ADD ONE new feature column to it per round. Splits, model,
-  seed, target, and baseline features are locked.
+  Playground path: `{{ playground_path }}`. Each round runs
+  `python -m bench run --features <factor> --cells {{ bench_cells }}`.
 
-  Baseline feature columns already in the trainer config (do NOT propose a
-  feature that produces an identical column name):
+  Baseline feature columns (your candidate is appended to these; do NOT
+  propose a feature that produces an identical column name):
   {% for col in baseline_feature_columns %}  - {{ col }}
   {% endfor %}
 
@@ -117,6 +135,31 @@ auto_alpha_experiment_setting: |-
   (your @register("...") string must NOT be any of these — collision will hard-fail):
   {% for name in baseline_feature_names %}  - {{ name }}
   {% endfor %}
+
+  **Acceptance rule (this session):**
+    - At least {{ accept_min_improved_cells }} cells must have
+      `delta_headline > 0` (headline = val_acc for classification,
+      val_ic_pearson for regression).
+    - No cell may have `delta_headline < -{{ accept_max_drop }}` (worst-case
+      regression guard — protects against trade-offs that buy one task at
+      another's expense).
+    - Both conditions must hold simultaneously.
+
+  Headline metrics are "higher is better":
+    - classification (`bucket_binary` label) → **val_acc** (↑)
+    - regression (`forward_logret` label)    → **val_ic_pearson** (↑, signed)
+
+  Notes for designing a robust factor:
+    - A factor that wins ONE cell by 0.05 but tanks another by 0.02 will
+      still get rejected. Prefer ideas that capture a real, broad signal —
+      microstructure, volatility regime, momentum at multiple scales —
+      over narrowly-tuned tricks.
+    - 1s and 1m data behave differently (noise floor, autocorrelation,
+      regime transitions). A truly good factor improves headline on BOTH
+      interval families.
+    - Classification and regression headlines can diverge (lgbm can
+      memorize cliffs that linreg can't extract). Aim for ideas that
+      lift both simultaneously.
 
 # ------------------------------------------------------------------
 # Hypothesis generation (used by AutoAlphaFactorHypothesisGen)
@@ -159,10 +202,11 @@ auto_alpha_hypothesis_specification: |-
   - Prefer named simple ideas (ATR, Choppiness, OBV-EMA, Range Expansion,
     True-Strength-Index, volume-weighted skew, etc.) over novel constructions
     until the easy wins are exhausted.
-  - **Acceptance bar:** the candidate must improve BOTH val_logloss AND
-    test_logloss (test is held out — no peeking by selection bias). A
-    candidate that improves val but degrades test will be rejected as
-    val-overfit.
+  - **Acceptance bar:** the candidate is accepted only when its bench
+    digest shows ≥ N cells improved on the val headline AND no cell's
+    headline drops beyond the worst-case tolerance. See the experiment
+    setting for the exact N and tolerance. Aim for broadly improving
+    signals, not narrowly-tuned wins.
 
 # ------------------------------------------------------------------
 # Hypothesis -> Experiment (used by AutoAlphaFactorHypothesis2Experiment)

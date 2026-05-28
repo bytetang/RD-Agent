@@ -191,28 +191,37 @@ class AutoAlphaFactorHypothesis2Experiment(FactorHypothesis2Experiment):
 
 
 class AutoAlphaFactorExperiment2Feedback(Experiment2Feedback):
-    """Translates eval_feature.py's JSON envelope into HypothesisFeedback.
+    """Translates bench's `_compare.json` digest into HypothesisFeedback.
 
-    Decision logic:
-      - status != ok                                          -> reject
-      - status == ok and delta.val_logloss < accept_threshold -> accept (improvement)
-      - n_rows_train drops > nan_drop_threshold fraction      -> reject (NaN drift)
-      - else                                                   -> reject (no signal)
+    The digest has the shape:
+        {
+          "schema_version": 1,
+          "tag": "...",
+          "compared_on": "val" | "test",
+          "features": [...],
+          "total_cells": N,
+          "headline_columns": {"classification": "val_acc", "regression": "val_ic_pearson"},
+          "cells": [
+            {"interval": "1m", "label_kind": "bucket", "horizon_s": 900,
+             "model": "lgbm", "task": "classification",
+             "headline_metric": "val_acc",
+             "baseline_headline": 0.731, "bench_headline": 0.733,
+             "delta_headline": 0.002, "delta_ic_p": ..., "delta_icir_p": ...,
+             "delta_acc": ..., "baseline_hash": "...", "bench_hash": "..."},
+            ...
+          ]
+        }
+
+    Decision: improved_cells >= accept_min_improved_cells AND
+              worst delta_headline >= -accept_max_drop.
+    Improved = delta_headline > 0 (headline metrics are all "higher is better"
+    given the current baseline sign convention).
     """
 
     def __init__(self, scen: Scenario) -> None:
         super().__init__(scen)
-        # Accept only when BOTH val and test logloss improve.
-        # Round-1 (5-feature baseline) found 70% val accepts with 79% test
-        # robustness; Round-2 (10-feature baseline) saw val accepts drop to
-        # 40% but test robustness collapsed to 15% — most "val winners"
-        # were noise / val-overfit. The dual-improvement rule keeps test
-        # honest by treating it as a second hold-out, not just a report.
-        # Both deltas must be strictly negative (we'll only call a candidate
-        # a winner if it survives BOTH the validation and test set).
-        self.accept_logloss_delta_threshold: float = 0.0
-        # If n_rows_train drops by more than this fraction, suspect NaN leakage.
-        self.nan_drop_fraction_threshold: float = 0.05
+        from rdagent.app.auto_alpha_loop.conf import AUTO_ALPHA_FACTOR_PROP_SETTING
+        self.settings = AUTO_ALPHA_FACTOR_PROP_SETTING
 
     def generate_feedback(
         self,
@@ -228,83 +237,108 @@ class AutoAlphaFactorExperiment2Feedback(Experiment2Feedback):
                 exception=exception,
             )
 
-        envelope: dict[str, Any] | None = getattr(exp, "result", None)
-        if not envelope or not isinstance(envelope, dict):
+        digest: dict[str, Any] | None = getattr(exp, "result", None)
+        if not digest or not isinstance(digest, dict):
             return HypothesisFeedback(
-                reason="no result envelope on experiment",
+                reason="no bench digest on experiment",
                 decision=False,
                 acceptable=False,
             )
 
-        status = envelope.get("status")
-        feature_name = envelope.get("feature_name", "?")
+        feature_name = digest.get("_feature_col", "?")
+        bench_rc = digest.get("_bench_returncode", 0)
+        cells = digest.get("cells") or []
 
-        if status != "ok":
-            findings = envelope.get("findings") or []
-            stderr_tail = envelope.get("stderr_tail") or ""
+        if not cells:
             return HypothesisFeedback(
                 reason=(
-                    f"feature {feature_name!r} failed with status={status}. "
-                    f"findings={findings} stderr_tail_excerpt={stderr_tail[-400:]}"
+                    f"feature {feature_name!r}: bench digest had 0 cells "
+                    f"(bench_rc={bench_rc}, "
+                    f"stderr_tail={digest.get('_bench_stderr_tail','')[-300:]!r})"
                 ),
                 decision=False,
                 acceptable=False,
-                observations=f"status={status}",
+                observations="empty digest",
             )
 
-        metrics = envelope.get("metrics") or {}
-        baseline = envelope.get("baseline_metrics") or {}
-        delta = envelope.get("delta") or {}
+        # Aggregate. delta_headline may be None on a cell that failed to run.
+        improved = 0
+        worsened: list[tuple[str, float]] = []
+        missing = 0
+        deltas_by_task: dict[str, list[float]] = {"classification": [], "regression": []}
 
-        val_delta = delta.get("val_logloss")
-        test_delta = delta.get("test_logloss")
-        cand_rows = metrics.get("n_rows_train")
-        base_rows = baseline.get("n_rows_train")
+        for c in cells:
+            cell_id = (
+                f"{c.get('model')}_{c.get('interval')}_"
+                f"{c.get('label_kind')}_{c.get('horizon_s')}s"
+            )
+            delta_h = c.get("delta_headline")
+            task = c.get("task", "?")
+            if delta_h is None:
+                missing += 1
+                continue
+            if task in deltas_by_task:
+                deltas_by_task[task].append(float(delta_h))
+            if delta_h > 0:
+                improved += 1
+            worsened.append((cell_id, float(delta_h)))
 
-        nan_drop_flag = False
-        if isinstance(cand_rows, (int, float)) and isinstance(base_rows, (int, float)) and base_rows > 0:
-            drop_frac = (base_rows - cand_rows) / base_rows
-            if drop_frac > self.nan_drop_fraction_threshold:
-                nan_drop_flag = True
+        worst_cell, worst_delta = min(worsened, key=lambda kv: kv[1]) if worsened else ("?", 0.0)
+        best_cell, best_delta = max(worsened, key=lambda kv: kv[1]) if worsened else ("?", 0.0)
 
-        val_passes = (
-            isinstance(val_delta, (int, float))
-            and val_delta < self.accept_logloss_delta_threshold
+        min_improved = self.settings.accept_min_improved_cells
+        max_drop = self.settings.accept_max_drop
+        decision = (
+            improved >= min_improved
+            and worst_delta >= -max_drop
+            and missing == 0
         )
-        test_passes = (
-            isinstance(test_delta, (int, float))
-            and test_delta < self.accept_logloss_delta_threshold
+
+        cls_avg = (
+            sum(deltas_by_task["classification"]) / len(deltas_by_task["classification"])
+            if deltas_by_task["classification"] else None
         )
-        decision = val_passes and test_passes and not nan_drop_flag
+        reg_avg = (
+            sum(deltas_by_task["regression"]) / len(deltas_by_task["regression"])
+            if deltas_by_task["regression"] else None
+        )
 
         reason_parts = [
             f"feature={feature_name}",
-            f"status=ok",
-            f"val_logloss={metrics.get('val_logloss')}",
-            f"val_logloss_delta={val_delta}",
-            f"test_logloss_delta={test_delta}",
-            f"val_auc_delta={delta.get('val_auc')}",
-            f"n_rows_train_delta={delta.get('n_rows_train')}",
+            f"cells={len(cells)} improved={improved} missing={missing}",
+            f"best={best_cell}:{best_delta:+.5f}",
+            f"worst={worst_cell}:{worst_delta:+.5f}",
+            f"avg_dheadline cls={cls_avg if cls_avg is None else f'{cls_avg:+.5f}'} "
+            f"reg={reg_avg if reg_avg is None else f'{reg_avg:+.5f}'}",
+            f"rule: improved>={min_improved} AND worst>=-{max_drop}",
         ]
-        # Spell out exactly why the candidate was rejected so the next-round
-        # LLM has a precise signal to learn from.
-        if not val_passes:
-            reason_parts.append("REJECTED: val_logloss did not improve")
-        elif not test_passes:
-            reason_parts.append(
-                "REJECTED: val improved but test did not — likely val-overfit"
-            )
-        if nan_drop_flag:
-            reason_parts.append(
-                f"REJECTED: n_rows_train drop fraction exceeds "
-                f"{self.nan_drop_fraction_threshold:.2%}"
+        if not decision:
+            if missing:
+                reason_parts.append(f"REJECTED: {missing} cells missing delta")
+            elif improved < min_improved:
+                reason_parts.append(
+                    f"REJECTED: only {improved}/{len(cells)} cells improved "
+                    f"(need >={min_improved})"
+                )
+            elif worst_delta < -max_drop:
+                reason_parts.append(
+                    f"REJECTED: worst cell {worst_cell} dropped {worst_delta:+.5f} "
+                    f"(< -{max_drop})"
+                )
+
+        # Compact per-cell line list for the next-round prompt to learn from.
+        per_cell = []
+        for c in cells:
+            per_cell.append(
+                f"{c.get('model')}/{c.get('interval')}/{c.get('label_kind')}/"
+                f"{c.get('horizon_s')}s {c.get('headline_metric')}: "
+                f"{c.get('baseline_headline')} -> {c.get('bench_headline')} "
+                f"(Δ={c.get('delta_headline')})"
             )
 
         return HypothesisFeedback(
             reason="; ".join(str(p) for p in reason_parts),
             decision=decision,
             acceptable=decision,
-            observations=(
-                f"metrics={metrics}\nbaseline={baseline}\ndelta={delta}"
-            ),
+            observations="cells:\n  " + "\n  ".join(per_cell),
         )

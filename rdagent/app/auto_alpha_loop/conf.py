@@ -6,8 +6,6 @@ or via a .env file in the working directory.
 """
 from __future__ import annotations
 
-from typing import Optional
-
 from pydantic_settings import SettingsConfigDict
 
 from rdagent.components.workflow.conf import BasePropSetting
@@ -18,51 +16,44 @@ class AutoAlphaFactorBasePropSetting(BasePropSetting):
 
     # 1) Override base class paths to point at the auto_alpha scenario.
     scen: str = "rdagent.scenarios.auto_alpha.experiment.scenario.AutoAlphaScenario"
-    """Scenario class for auto_alpha factor mining."""
-
     hypothesis_gen: str = (
         "rdagent.scenarios.auto_alpha.proposal.factor_proposal.AutoAlphaFactorHypothesisGen"
     )
-    """Hypothesis generation class."""
-
     hypothesis2experiment: str = (
         "rdagent.scenarios.auto_alpha.proposal.factor_proposal.AutoAlphaFactorHypothesis2Experiment"
     )
-    """Hypothesis -> Experiment converter class."""
-
     coder: str = "rdagent.scenarios.auto_alpha.developer.coder.AutoAlphaFactorCoder"
-    """Single-shot LLM coder for feature plugins."""
-
     runner: str = "rdagent.scenarios.auto_alpha.developer.runner.AutoAlphaFactorRunner"
-    """Shells out to playground's scripts/eval_feature.py."""
-
     summarizer: str = (
         "rdagent.scenarios.auto_alpha.proposal.factor_proposal.AutoAlphaFactorExperiment2Feedback"
     )
-    """Translates eval JSON envelope into HypothesisFeedback."""
 
-    # 2) auto_alpha-specific settings.
+    # 2) auto_alpha-specific settings — new bench-based flow.
 
     playground_path: str = "/Users/jie/Documents/src/auto-alpha-playground"
     """Absolute path to the auto-alpha-playground checkout."""
 
-    eval_config_name: str = "configs/train_baseline_eval_1m.yaml"
-    """Path (relative to playground_path) of the frozen evaluation config."""
+    bench_cells: str = "fast"
+    """`--cells` preset passed to `python -m bench run`. 'fast' = drop slow
+    1s lgbm cells (12 cells remain); 'all' = full 14-cell sweep; or an
+    fnmatch glob like 'lgbm_1m_*'."""
 
-    confirmation_eval_config_name: str = "configs/train_baseline_eval_1s.yaml"
-    """Slower confirmation eval config (1s kline); used for top-K survivors."""
+    accept_min_improved_cells: int = 6
+    """Minimum number of cells with delta_headline > 0 to accept the candidate."""
 
-    raw_input_dir: Optional[str] = None
-    """Override for raw kline directory; None = use eval config default."""
-
-    featurized_output_dir: Optional[str] = None
-    """Override for featurized output directory; None = use eval config default."""
+    accept_max_drop: float = 0.005
+    """Maximum allowed drop in headline metric on the worst cell. A candidate
+    is rejected if any cell has delta_headline < -accept_max_drop. Headline
+    metrics are val_acc (classification) and val_ic_pearson (regression)."""
 
     subprocess_timeout_seconds: int = 1800
-    """Per-subprocess timeout passed through to eval_feature.py."""
+    """Per-bench-subprocess timeout. Fast sweep should finish in ~3 min on
+    M-series; we leave generous headroom for I/O hiccups."""
 
     keep_success: bool = False
-    """If True, accepted feature plugins are kept in featurizer/features/."""
+    """If True, accepted feature plugins are KEPT in featurizer/features/
+    after the round. CAUTION: this shifts the baseline ground truth for
+    subsequent rounds. Default False keeps each round independent."""
 
 
 AUTO_ALPHA_FACTOR_PROP_SETTING = AutoAlphaFactorBasePropSetting()

@@ -1,17 +1,30 @@
 """
-AutoAlphaFactorRunner — shells out to the playground's eval_feature.py.
+AutoAlphaFactorRunner — shells out to the playground's `python -m bench run`.
 
-The runner is intentionally thin: it writes the generated feature file to a
-tempfile, invokes the playground's atomic eval CLI, parses the returned JSON
-envelope, and pins it onto `exp.result`. Caching is delegated to CachedRunner
-which keys by md5(task_info).
+Pipeline per round:
+  1. Stage the coded feature plugin into <playground>/featurizer/features/<name>.py
+  2. Invoke `python -m bench run --features <feature_col> --cells <preset>`
+     which featurizes (cached) + sweeps all configured cells + writes
+     `runs/bench/<tag>/_compare.json` digesting per-cell deltas vs the
+     committed `benchmarks/baseline.csv`.
+  3. Read the digest, pin it onto `exp.result`.
+  4. Unstage the plugin file (unless `keep_success=True` and the decision is
+     accept — handled by the feedback step that knows the decision).
+
+The runner does NOT decide accept/reject; it only produces the digest. The
+feedback class consumes the digest and applies the threshold rule.
+
+On any infrastructure failure (lint stage already done by coder; here it's
+featurize crash / sweep crash / missing digest) the runner raises CoderError
+so the outer loop records the failure as feedback.
 """
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -29,34 +42,31 @@ from rdagent.scenarios.auto_alpha.experiment.factor_experiment import (
 
 
 def _minimal_env() -> dict[str, str]:
-    """Subprocess env passed to eval_feature.py: keep PATH/locale/home only.
-    Never forward LLM keys or other secrets to playground subprocesses."""
-    import os
-    keep = {}
-    for k in ("PATH", "PYTHONPATH", "LANG", "LC_ALL", "LC_CTYPE", "HOME", "TMPDIR"):
+    """Subprocess env: keep PATH/locale/home and pass through AAP_* so the
+    playground can find data dirs. Never forward LLM keys."""
+    keep: dict[str, str] = {}
+    for k in ("PATH", "PYTHONPATH", "LANG", "LC_ALL", "LC_CTYPE", "HOME", "TMPDIR", "USER"):
         if k in os.environ:
             keep[k] = os.environ[k]
+    for k, v in os.environ.items():
+        if k.startswith("AAP_"):
+            keep[k] = v
     return keep
 
 
 class AutoAlphaFactorRunner(CachedRunner[AutoAlphaFactorExperiment]):
-    """Calls `scripts/eval_feature.py --feature-file ... --eval-config ...` and
-    parses the JSON envelope.
-
-    On any non-`ok` status the runner raises CoderError so the outer loop
-    records a failure with the parsed stderr_tail / findings as feedback.
-    """
+    """Calls `python -m bench run --features <col> --cells <preset>` and
+    parses `runs/bench/<tag>/_compare.json`."""
 
     def __init__(self, scen: Scenario) -> None:
         super().__init__(scen)
         self.settings = AUTO_ALPHA_FACTOR_PROP_SETTING
         self.playground_path = Path(self.settings.playground_path).expanduser().resolve()
+        self.features_dir = self.playground_path / "featurizer" / "features"
 
     def get_cache_key(self, exp: Experiment) -> str:
-        # Default CachedRunner hashes by task info — append eval_config so a
-        # config change invalidates cached results automatically.
         base = super().get_cache_key(exp)
-        return f"{base}__{self.settings.eval_config_name}"
+        return f"{base}__bench_{self.settings.bench_cells}"
 
     def develop(self, exp: AutoAlphaFactorExperiment) -> AutoAlphaFactorExperiment:
         if not exp.sub_workspace_list or exp.sub_workspace_list[0] is None:
@@ -72,64 +82,106 @@ class AutoAlphaFactorRunner(CachedRunner[AutoAlphaFactorExperiment]):
             )
         code = workspace.file_dict[filename]
 
-        with tempfile.NamedTemporaryFile(
-            "w", suffix=f"__{task.factor_name}.py", delete=False, encoding="utf-8"
-        ) as tf:
-            tf.write(code)
-            feature_path = tf.name
+        # bench --features takes the *column* name (e.g. `atr_14`), not the
+        # registered name. Column = registered_name + "_" + param_values when
+        # the plugin has params, else just registered_name. This must match
+        # featurizer/features/__init__.py::_default_column.
+        params = task.variables or {}
+        if params:
+            feature_col = "_".join(
+                [task.factor_name] + [str(v) for v in params.values()]
+            )
+        else:
+            feature_col = task.factor_name
+
+        staged_path = self.features_dir / filename
+        if staged_path.exists():
+            raise CoderError(
+                f"staging collision: {staged_path} already exists "
+                f"(prior round leak or duplicate proposal)"
+            )
+
+        staged_path.write_text(code, encoding="utf-8")
+        logger.info(f"staged {staged_path}")
 
         try:
             cmd = [
-                sys.executable,
-                "scripts/eval_feature.py",
-                "--feature-file", feature_path,
-                "--eval-config", self.settings.eval_config_name,
-                "--timeout", str(self.settings.subprocess_timeout_seconds),
+                sys.executable, "-m", "bench", "run",
+                "--features", feature_col,
+                "--cells", self.settings.bench_cells,
             ]
-            if self.settings.raw_input_dir:
-                cmd += ["--raw-input-dir", self.settings.raw_input_dir]
-            if self.settings.featurized_output_dir:
-                cmd += ["--featurized-output-dir", self.settings.featurized_output_dir]
-            if self.settings.keep_success:
-                cmd.append("--keep-success")
-
-            logger.info(f"eval_feature: {' '.join(cmd)}")
+            logger.info(f"bench run: {' '.join(cmd)}")
             proc = subprocess.run(
                 cmd,
                 cwd=str(self.playground_path),
                 capture_output=True,
                 text=True,
-                timeout=self.settings.subprocess_timeout_seconds + 60,
+                timeout=self.settings.subprocess_timeout_seconds,
                 env=_minimal_env(),
                 check=False,
             )
+            stdout = proc.stdout
+            stderr = proc.stderr
+
+            # Locate the digest path. bench prints `[bench.compare] tag=<tag>
+            # compare=<csv> digest=<json> (verbose=...)`.
+            digest_path: Path | None = None
+            for line in stdout.splitlines():
+                if "[bench.compare]" in line and "digest=" in line:
+                    for tok in line.split():
+                        if tok.startswith("digest="):
+                            digest_path = Path(tok.split("=", 1)[1])
+                            break
+            # Fallback: also accept the sweep-only log line.
+            if digest_path is None:
+                for line in stdout.splitlines():
+                    if "[bench.sweep]" in line and "tag=" in line:
+                        # tag=<utc>__<slug>
+                        for tok in line.split():
+                            if tok.startswith("tag="):
+                                tag = tok.split("=", 1)[1]
+                                digest_path = (
+                                    self.playground_path / "runs" / "bench" / tag / "_compare.json"
+                                )
+                                break
+
+            if not digest_path or not digest_path.exists():
+                tail_out = stdout[-1500:]
+                tail_err = stderr[-1500:]
+                raise CoderError(
+                    f"bench run exit={proc.returncode}; digest not found "
+                    f"(parsed path={digest_path}). stdout_tail={tail_out!r} "
+                    f"stderr_tail={tail_err!r}"
+                )
+
+            try:
+                digest: dict[str, Any] = json.loads(digest_path.read_text())
+            except json.JSONDecodeError as exc:
+                raise CoderError(f"could not parse {digest_path}: {exc}") from exc
+
+            # Annotate digest with bench exit code so feedback can see partial failures.
+            digest["_bench_returncode"] = proc.returncode
+            digest["_bench_stderr_tail"] = stderr[-1000:] if proc.returncode != 0 else ""
+            digest["_feature_col"] = feature_col
+
+            exp.result = digest
+            logger.info(
+                f"bench digest: {len(digest.get('cells', []))} cells, "
+                f"compared_on={digest.get('compared_on')}, "
+                f"bench_rc={proc.returncode}"
+            )
+
+            if proc.returncode != 0:
+                # Some cells failed — surface as CoderError; feedback won't run.
+                raise CoderError(
+                    f"bench run exit={proc.returncode}; "
+                    f"stderr_tail={stderr[-800:]!r}"
+                )
+
+            return exp
         finally:
-            Path(feature_path).unlink(missing_ok=True)
-
-        if proc.returncode != 0 and not proc.stdout.strip():
-            raise CoderError(
-                f"eval_feature.py exited {proc.returncode} with no JSON; "
-                f"stderr tail: {proc.stderr[-1000:]}"
-            )
-
-        try:
-            envelope: dict[str, Any] = json.loads(proc.stdout)
-        except json.JSONDecodeError as exc:
-            raise CoderError(
-                f"eval_feature.py stdout was not JSON: {exc}; "
-                f"stdout tail: {proc.stdout[-1000:]}"
-            ) from exc
-
-        exp.result = envelope
-        status = envelope.get("status")
-        logger.info(f"eval_feature status: {status}")
-
-        if status != "ok":
-            # Bubble up the failure as a CoderError so RDLoop records a feedback
-            # node with the structured failure info preserved in exp.result.
-            reason = envelope.get("stderr_tail") or envelope.get("findings") or "unknown"
-            raise CoderError(
-                f"eval_feature returned status={status} for {task.factor_name}: {reason}"
-            )
-
-        return exp
+            # Always unstage. (Future: if accept + keep_success, leave it; but
+            # that's risky because next-round baseline would then include this
+            # feature and shift the ground truth. Keep clean by default.)
+            if staged_path.exists() and not self.settings.keep_success:
+                staged_path.unlink()

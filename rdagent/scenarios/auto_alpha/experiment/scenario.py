@@ -9,8 +9,6 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 
-import yaml
-
 from rdagent.app.auto_alpha_loop.conf import AUTO_ALPHA_FACTOR_PROP_SETTING
 from rdagent.core.experiment import Task
 from rdagent.core.scenario import Scenario
@@ -25,38 +23,34 @@ def _read_playground_file(playground_path: str, relpath: str) -> str:
 
 
 # Mapping from baseline trainer-feature-column names back to the registered
-# feature plugin name (i.e., the @register("...") string). Names on the right
-# are the ones the LLM must NOT propose as new factor_name values.
-#
-# Keep this aligned with playground's featurizer/features/ registrations.
+# feature plugin name (i.e., the @register("...") string).
 _COLUMN_TO_REGISTERED_NAME = {
     "logret_1": "logret",
     "rsi_14": "rsi",
     "macd_12_26_9": "macd",
     "bollinger_20_2.0": "bollinger",
     "volume_z_20": "volume_z",
-    # Round-2 baseline additions (top-5 winners promoted after ensemble validation):
-    "tsi": "tsi",
-    "trix": "trix",
-    "atr": "atr",
-    "chop": "chop",
-    "cmf_adx_prod": "cmf_adx_prod",
 }
 
 
-def _baseline_registered_names_from_eval_config(eval_cfg_path: Path) -> list[str]:
-    """Read the frozen eval config and resolve each baseline feature column
-    back to its registered plugin name. Returns sorted unique names."""
-    if not eval_cfg_path.exists():
+def _baseline_columns_from_bench(playground_path: str) -> list[str]:
+    """Source of truth: `BASELINE_FEATURES` in playground's bench/runner.py."""
+    p = Path(playground_path) / "bench" / "runner.py"
+    if not p.exists():
         return []
-    cfg = yaml.safe_load(eval_cfg_path.read_text())
-    columns = list(cfg.get("features", []) or [])
-    names: set[str] = set()
-    for col in columns:
-        # If we know the mapping, use it; else assume the column name itself
-        # is the registered name (param-less plugin convention).
-        names.add(_COLUMN_TO_REGISTERED_NAME.get(col, col))
-    return sorted(names)
+    cols: list[str] = []
+    in_block = False
+    for raw in p.read_text().splitlines():
+        line = raw.strip()
+        if line.startswith("BASELINE_FEATURES"):
+            in_block = True
+            continue
+        if in_block:
+            if line.startswith("]"):
+                break
+            if line.startswith('"') or line.startswith("'"):
+                cols.append(line.strip(",").strip('"').strip("'"))
+    return cols
 
 
 class AutoAlphaScenario(Scenario):
@@ -77,16 +71,11 @@ class AutoAlphaScenario(Scenario):
         self._feature_spec = _read_playground_file(playground, "FEATURE_SPEC.md")
         self._playground_readme = _read_playground_file(playground, "README.md")
 
-        # Resolve baseline feature column list -> registered plugin names.
-        # The LLM must avoid proposing these names (it caused round-1 collision
-        # in the first flash session: LLM proposed `rsi` against baseline `rsi_14`).
-        eval_cfg_path = Path(playground) / AUTO_ALPHA_FACTOR_PROP_SETTING.eval_config_name
-        self._baseline_feature_names = _baseline_registered_names_from_eval_config(eval_cfg_path)
-        self._baseline_feature_columns = list(
-            (yaml.safe_load(eval_cfg_path.read_text()).get("features", []) or [])
-            if eval_cfg_path.exists()
-            else []
-        )
+        # Resolve baseline feature columns from playground's bench/runner.py.
+        self._baseline_feature_columns = _baseline_columns_from_bench(playground)
+        self._baseline_feature_names = sorted({
+            _COLUMN_TO_REGISTERED_NAME.get(c, c) for c in self._baseline_feature_columns
+        })
 
         self._background = deepcopy(T("scenarios.auto_alpha.prompts:auto_alpha_background").r())
         self._source_data = deepcopy(T("scenarios.auto_alpha.prompts:auto_alpha_source_data").r())
@@ -96,7 +85,7 @@ class AutoAlphaScenario(Scenario):
         )
         self._simulator = deepcopy(
             T("scenarios.auto_alpha.prompts:auto_alpha_simulator").r(
-                eval_config=AUTO_ALPHA_FACTOR_PROP_SETTING.eval_config_name,
+                bench_cells=AUTO_ALPHA_FACTOR_PROP_SETTING.bench_cells,
                 playground_path=playground,
             )
         )
@@ -105,10 +94,12 @@ class AutoAlphaScenario(Scenario):
         )
         self._experiment_setting = deepcopy(
             T("scenarios.auto_alpha.prompts:auto_alpha_experiment_setting").r(
-                eval_config=AUTO_ALPHA_FACTOR_PROP_SETTING.eval_config_name,
+                bench_cells=AUTO_ALPHA_FACTOR_PROP_SETTING.bench_cells,
                 playground_path=playground,
                 baseline_feature_columns=self._baseline_feature_columns,
                 baseline_feature_names=self._baseline_feature_names,
+                accept_min_improved_cells=AUTO_ALPHA_FACTOR_PROP_SETTING.accept_min_improved_cells,
+                accept_max_drop=AUTO_ALPHA_FACTOR_PROP_SETTING.accept_max_drop,
             )
         )
 
